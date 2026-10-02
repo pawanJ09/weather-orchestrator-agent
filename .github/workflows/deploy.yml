@@ -48,14 +48,25 @@ jobs:
               --role-name "$ROLE_NAME" \
               --assume-role-policy-document file://iam/trust-policy.json
 
-            aws iam put-role-policy \
-              --role-name "$ROLE_NAME" \
-              --policy-name "${ROLE_NAME}-permissions" \
-              --policy-document file://iam/execution-role-policy.json
-
             echo "New role created — waiting for IAM propagation..."
             sleep 10
           fi
+          
+          # Runs every deploy, not just on first creation: put-role-policy
+          # fully replaces the named inline policy each time, so this
+          # keeps the live role's permissions in sync with
+          # iam/execution-role-policy.json whenever that file changes --
+          # e.g. adding the AWS Marketplace auto-subscribe permissions
+          # after the fact, as happened here. A "create only if missing"
+          # step would silently skip reapplying permissions on every
+          # subsequent deploy, which is exactly the gap that made this
+          # fix require a manual workflow edit instead of "just push."
+          
+          echo "Applying current execution permissions..."
+          aws iam put-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-name "${ROLE_NAME}-permissions" \
+            --policy-document file://iam/execution-role-policy.json
 
       - name: Resolve execution role ARN
         id: role
