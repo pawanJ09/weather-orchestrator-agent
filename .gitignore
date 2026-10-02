@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+function.zip
+response.json
+.venv/
+venv/
+.DS_Store
+.idea/

@@ -1,0 +1,152 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required for OIDC -> AWS role assumption
+  contents: read
+
+env:
+  FUNCTION_NAME: weather-orchestrator-agent
+  ROLE_NAME: weather-orchestrator-agent-role
+  AWS_REGION: us-east-1
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Build & deploy
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build deployment package
+        run: |
+          mkdir -p build
+          cp src/handler.py build/
+          cd build && zip -r ../function.zip .
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure execution role exists (create on first run only)
+        run: |
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Role $ROLE_NAME already exists — skipping creation."
+          else
+            echo "Role $ROLE_NAME not found — creating it."
+            aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file://iam/trust-policy.json
+
+            aws iam put-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-name "${ROLE_NAME}-permissions" \
+              --policy-document file://iam/execution-role-policy.json
+
+            echo "New role created — waiting for IAM propagation..."
+            sleep 10
+          fi
+
+      - name: Resolve execution role ARN
+        id: role
+        run: |
+          ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+          echo "arn=$ROLE_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy code to Lambda (create on first run, update after)
+        run: |
+          # Same comma/quote/newline-safe JSON construction as
+          # outfit-suggestion-agent's deploy.yml -- the AWS CLI's
+          # shorthand `Variables={K=V}` syntax breaks on a multi-sentence
+          # prompt. See that repo's deploy.yml comment for the full
+          # explanation of why this is built this way.
+          ENV_JSON=$(python3 -c "
+          import json
+          with open('config/instructions.txt') as f:
+              text = f.read()
+          print(json.dumps({'Variables': {'ORCHESTRATOR_INSTRUCTIONS': text}}))
+          ")
+
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            echo "Function $FUNCTION_NAME already exists — updating code and config."
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://function.zip \
+              --publish
+            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+            aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --environment "$ENV_JSON"
+            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+          else
+            echo "Function $FUNCTION_NAME not found — creating it."
+            for attempt in 1 2 3 4 5; do
+              if aws lambda create-function \
+                  --function-name "$FUNCTION_NAME" \
+                  --runtime python3.14 \
+                  --handler handler.lambda_handler \
+                  --role "${{ steps.role.outputs.arn }}" \
+                  --zip-file fileb://function.zip \
+                  --timeout 60 \
+                  --memory-size 256 \
+                  --environment "$ENV_JSON" \
+                  --publish; then
+                break
+              fi
+              echo "create-function failed (role may not have propagated yet) — retrying in 10s [$attempt/5]"
+              sleep 10
+            done
+            aws lambda wait function-active --function-name "$FUNCTION_NAME"
+          fi
+
+  validate:
+    name: Smoke-test the deployed function
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Invoke deployed Lambda with sample request
+        run: |
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out \
+            --payload file://events/sample_event_direct.json \
+            --cli-read-timeout 90 \
+            response.json
+          echo "--- raw response ---"
+          cat response.json
+
+      - name: Assert the response was successful
+        run: |
+          STATUS=$(jq -r '.statusCode' response.json)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Deployed Lambda did not return 200 (got: $STATUS)"
+            exit 1
+          fi
+          BODY_HAS_ANSWER=$(jq -r '.body' response.json | jq -r 'has("answer")')
+          if [ "$BODY_HAS_ANSWER" != "true" ]; then
+            echo "::error::Response body is missing 'answer'"
+            exit 1
+          fi
+          echo "✅ Orchestrator responded successfully"
+          echo "--- answer ---"
+          jq -r '.body' response.json | jq -r '.answer'

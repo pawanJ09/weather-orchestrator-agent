@@ -1,0 +1,3 @@
+# No packaged runtime dependencies. handler.py imports boto3, but boto3
+# ships preinstalled in every AWS Lambda Python runtime -- it does not
+# need to be vendored into the deployment zip.
